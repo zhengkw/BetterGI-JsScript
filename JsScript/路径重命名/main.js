@@ -22,6 +22,17 @@ if (allowedCDCategories.length > 0) {
 const DIR_MAX_DEPTH = Math.max(1, parseInt(settings.maxDepth || 5, 10)); // 默认5，最小1
 log.info(`目录读取深度：${DIR_MAX_DEPTH}层（配置取settings.maxDepth，默认5，最小1）`);
 
+// 输出目录最大深度处理：空值或 999 表示不限制，否则取配置值
+let MAX_OUTPUT_DEPTH = 999; // 默认不限制
+if (settings.maxOutputDepth !== undefined && settings.maxOutputDepth !== null && settings.maxOutputDepth !== '') {
+  const parsedDepth = parseInt(settings.maxOutputDepth, 10);
+  if (!isNaN(parsedDepth) && parsedDepth >= 1) {
+    MAX_OUTPUT_DEPTH = parsedDepth;
+  }
+}
+log.info(`输出目录最大深度：${MAX_OUTPUT_DEPTH === 999 ? '不限制（保留原层级）' : MAX_OUTPUT_DEPTH + '层'}（配置取 settings.maxOutputDepth，默认空值为不限制）`);
+
+
 // 读取材料分类文件（通用逻辑）
 function readMaterialCD(materialCDDir) {
   const materialFilePaths = readAllFilePaths(materialCDDir, 0, 1, ['.txt']);
@@ -106,7 +117,7 @@ function extractResourceNameFromPath(filePath, cdMaterialNames) {
   if (validDepths.length > 1) {
     log.debug(`材料名【${bestMatch.name}】存在多层目录匹配，选择最外层（层级${bestMatch.depth}）`);
   }
-  return bestMatch.name;
+  return { name: bestMatch.name, depth: bestMatch.depth };
 }
 
 // ==============================================
@@ -159,12 +170,11 @@ function generateContentCode(positions) {
 // 主程序逻辑（通用流程）
 // ==============================================
 const MAX_TELEPORT_DISTANCE = 100.0;
-
 async function main() {
   try {
-    // 1. 读取并解析材料CD，收集正式材料名（保留特殊符号）
+    // 1. 读取并解析材料 CD，收集正式材料名（保留特殊符号）
     if (!pathExists(materialCDDir)) {
-      log.error(`❌ 材料CD目录不存在: ${materialCDDir}`);
+      log.error(`❌ 材料 CD 目录不存在：${materialCDDir}`);
       return;
     }
     const CDCategories = readMaterialCD(materialCDDir);
@@ -173,7 +183,7 @@ async function main() {
     // 收集所有选中分类下的材料名（保留原始符号，仅去空格）
     for (const [categoryName, cdInfo] of Object.entries(CDCategories)) {
       if (allowedCDCategories.length > 0 && !allowedCDCategories.includes(categoryName)) {
-        log.debug(`跳过未选中的CD分类：${categoryName}`);
+        log.debug(`跳过未选中的 CD 分类：${categoryName}`);
         continue;
       }
       for (const [_, materialListObj] of Object.entries(cdInfo)) {
@@ -191,17 +201,17 @@ async function main() {
       return;
     }
     log.info(`✅ 共收集到${cdMaterialNames.size}个正式材料名（已过滤）`);
-    log.info(`CD文件中存在的材料名（含符号）：${Array.from(cdMaterialNames).join(', ')}`);
+    log.info(`CD 文件中存在的材料名（含符号）：${Array.from(cdMaterialNames).join(', ')}`);
 
-    // 2. 读取并解析传送点文件（使用tranPosition）
+    // 2. 读取并解析传送点文件（使用 tranPosition）
     const tpFilePath = "assets/tp.json";
     if (!fileExists(tpFilePath)) {
-      log.error(`❌ 传送点文件不存在: ${tpFilePath}`);
+      log.error(`❌ 传送点文件不存在：${tpFilePath}`);
       return;
     }
 
     let tpContent = safeReadTextSync(tpFilePath);
-    tpContent = fixJsonFormat(tpContent); // 增强版JSON修复
+    tpContent = fixJsonFormat(tpContent); // 增强版 JSON 修复
     const topLevelData = JSON.parse(tpContent);
     const tpData = extractTeleportPoints(topLevelData);
 
@@ -214,20 +224,30 @@ async function main() {
     // 3. 读取路径文件并处理
     const pathingDir = "pathing";
     if (!pathExists(pathingDir)) {
-      log.error(`❌ 路径目录不存在: ${pathingDir}`);
+      log.error(`❌ 路径目录不存在：${pathingDir}`);
       return;
     }
     const pathFiles = readAllFilePaths(pathingDir, 0, DIR_MAX_DEPTH, ['.json']);
     log.info(`✅ 找到${pathFiles.length}个路径文件待处理`);
 
+    // 用于记录每个输出目录下已处理的校验码（按目录分别去重）
+    const outputDirCodesMap = new Map();
+    let duplicateCount = 0;
+    let successCount = 0;
+
     // 处理每个路径文件
     for (const pathFile of pathFiles) {
-      await processPathFile(pathFile, tpData, cdMaterialNames);
+      const result = await processPathFile(pathFile, tpData, cdMaterialNames, outputDirCodesMap);
+      if (result?.isDuplicate) {
+        duplicateCount++;
+      } else if (result?.success) {
+        successCount++;
+      }
     }
 
-    log.info(`✅ 所有文件处理完成`);
+    log.info(`✅ 所有文件处理完成：成功 ${successCount} 个，跳过重复 ${duplicateCount} 个`);
   } catch (error) {
-    log.error(`❌ 程序异常: ${error.message}`);
+    log.error(`❌ 程序异常：${error.message}`);
   }
 }
 
@@ -250,11 +270,11 @@ function extractTeleportPoints(topLevelData) {
         ...point,
         sceneMapName: scene.mapName || "",
         sceneDescription: scene.description || "未知区域"
-      })).filter(point => 
+      })).filter(point =>
         point?.tranPosition?.length >= 3 && // 验证tranPosition存在且有效
-        point.id !== undefined && 
-        point.country && 
-        point.area && 
+        point.id !== undefined &&
+        point.country &&
+        point.area &&
         point.name
       );
       allPoints.push(...validPoints);
@@ -263,35 +283,37 @@ function extractTeleportPoints(topLevelData) {
   });
   return allPoints;
 }
-
 // 处理单个路径文件（保留特殊符号匹配）
-async function processPathFile(pathFile, tpData, cdMaterialNames) {
+async function processPathFile(pathFile, tpData, cdMaterialNames, outputDirCodesMap) {
   try {
     const normalizedPath = pathFile.replace(/\\/g, '/');
     const fileName = basename(normalizedPath);
 
     // 1. 提取材料名（保留符号，优先目录，次取文件名）
-    let materialName = extractResourceNameFromPath(normalizedPath, cdMaterialNames);
+    let materialInfo = extractResourceNameFromPath(normalizedPath, cdMaterialNames);
 
-    // 目录未匹配时，从文件名提取（适配带符号的材料名，如“01-「冷鲜肉」-xxx.json”）
-    if (!materialName) {
-      const nameMatch = fileName.match(/\d+-([^-]+)-/); // 提取“「冷鲜肉」”部分
+    // 目录未匹配时，从文件名提取（适配带符号的材料名，如"01-「冷鲜肉」-xxx.json"）
+    if (!materialInfo) {
+      const nameMatch = fileName.match(/\d+-([^-]+)-/); // 提取"「冷鲜肉」"部分
       if (nameMatch) {
         const fileNameMat = nameMatch[1].trim(); // 保留符号
         if (cdMaterialNames.has(fileNameMat)) {
-          materialName = fileNameMat;
-          log.debug(`目录未匹配，从文件名提取材料名（含符号）：${materialName}`);
+          materialInfo = {name: fileNameMat, depth: -1}; // 文件名匹配，深度标记为 -1
+          log.debug(`目录未匹配，从文件名提取材料名（含符号）：${materialInfo.name}`);
         }
       }
     }
 
     // 未匹配到材料名则跳过（记录异常）
-    if (!materialName) {
+    if (!materialInfo) {
       log.warn(`⚠️ ${fileName} 未匹配到正式材料名，跳过`);
-      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录: ${fileName} - 未匹配到正式材料名`;
+      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录：${fileName} - 未匹配到正式材料名`;
       await writeFile("异常路径记录.log", errorContent, true);
-      return;
+      return null;
     }
+
+    const materialName = materialInfo.name;
+    const materialDepth = materialInfo.depth;
 
     // 2. 读取并解析路径内容
     const pathContent = safeReadTextSync(normalizedPath);
@@ -301,21 +323,21 @@ async function processPathFile(pathFile, tpData, cdMaterialNames) {
 
     if (!Array.isArray(positions) || positions.length === 0) {
       log.warn(`⚠️ ${fileName} 无有效位置数据，跳过`);
-      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录: ${fileName} - 无有效位置数据`;
+      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录：${fileName} - 无有效位置数据`;
       await writeFile("异常路径记录.log", errorContent, true);
-      return;
+      return null;
     }
 
-    // 3. 生成检测码
+    // 3. 生成检测码（基于坐标内容）
     const contentCode = generateContentCode(positions);
 
-    // 4. 匹配最近的传送点（使用tranPosition计算）
+    // 4. 匹配最近的传送点（使用 tranPosition 计算）
     const teleportPos = positions.find(pos => pos.type === "teleport");
     if (!teleportPos) {
-      log.warn(`⚠️ ${fileName} 无teleport点，跳过`);
-      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录: ${fileName} - 无teleport点`;
+      log.warn(`⚠️ ${fileName} 无 teleport 点，跳过`);
+      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录：${fileName} - 无 teleport 点`;
       await writeFile("异常路径记录.log", errorContent, true);
-      return;
+      return null;
     }
     const targetX = parseFloat(teleportPos.x);
     const targetY = parseFloat(teleportPos.y);
@@ -323,40 +345,67 @@ async function processPathFile(pathFile, tpData, cdMaterialNames) {
 
     if (!closestTp) {
       log.warn(`⚠️ ${fileName} 未找到有效传送点（距离>100），跳过`);
-      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录: ${fileName} - 未找到有效传送点（距离>100）`;
+      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录：${fileName} - 未找到有效传送点（距离>100）`;
       await writeFile("异常路径记录.log", errorContent, true);
-      return;
+      return null;
     }
 
     // 5. 构建新文件名（保留材料名原始符号）
     const newFileName = `${materialName}-${closestTp.sceneDescription}-${closestTp.country}-${closestTp.area}-${closestTp.id}-${closestTp.name}-${contentCode}.json`
-      .replace(/[\\/:*?"<>|]/g, "-"); // 仅过滤系统非法字符
+        .replace(/[\\/:*?"<>|]/g, "-"); // 仅过滤系统非法字符
 
-    // 保留原目录结构
+    // 保留到材料名所在层级的目录结构（pathing 不算层数）
     const afterPathing = normalizedPath.replace(/^pathing\//, "");
-    const middleDir = afterPathing.substring(0, afterPathing.lastIndexOf('/') + 1);
+    const originalDirParts = afterPathing.split('/').filter(part => part);
+
+    // 如果材料名来自目录匹配，保留到该层级；否则根据配置深度截断
+    let keptDirs = [];
+    if (materialDepth > 0) {
+      // 材料名在目录中，保留到该层级（depth 已包含 pathing，需减 1）
+      keptDirs = originalDirParts.slice(0, materialDepth);
+    } else {
+      // 材料名来自文件名，使用配置的 maxOutputDepth
+      const actualDepth = Math.min(originalDirParts.length, MAX_OUTPUT_DEPTH);
+      keptDirs = originalDirParts.slice(0, actualDepth);
+    }
+
+    const middleDir = keptDirs.length > 0 ? keptDirs.join('/') + '/' : '';
     const outputDir = `rename/${middleDir}`;
     const baseOutputPath = `${outputDir}${newFileName}`;
+    // 6. 检查当前输出目录下是否已有相同校验码的文件
+    if (!outputDirCodesMap.has(outputDir)) {
+      outputDirCodesMap.set(outputDir, new Set());
+    }
+    const dirCodes = outputDirCodesMap.get(outputDir);
 
-    // 6. 处理重复文件并写入
-    const uniqueOutputPath = getUniqueFilePath(baseOutputPath);
-    const writeResult = file.WriteTextSync(uniqueOutputPath, pathContent, false);
+    if (dirCodes.has(contentCode)) {
+      log.info(`⚠️ ${fileName} 在当前输出目录 ${outputDir} 下检测到重复内容（校验码：${contentCode}），跳过`);
+      return {isDuplicate: true};
+    }
+
+    // 7. 写入文件
+    // 7. 写入文件
+    const writeResult = file.WriteTextSync(baseOutputPath, pathContent, false);
 
     if (writeResult) {
-      log.info(`✅ ${fileName} → ${basename(uniqueOutputPath)}`);
+      // 记录当前目录的校验码
+      dirCodes.add(contentCode);
+      log.info(`✅ ${fileName} → ${basename(baseOutputPath)}`);
+      return {success: true};
     } else {
-      log.error(`❌ 写入文件失败: ${uniqueOutputPath}`);
-      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录: ${fileName} - 写入文件失败（${uniqueOutputPath}）`;
+      log.error(`❌ 写入文件失败：${baseOutputPath}`);
+      const errorContent = `[${new Date().toLocaleString()}] 异常路径记录：${fileName} - 写入文件失败（${baseOutputPath}）`;
       await writeFile("异常路径记录.log", errorContent, true);
+      return null;
     }
 
   } catch (error) {
-    log.error(`❌ 处理${basename(pathFile)}出错: ${error.message}`);
-    const errorContent = `[${new Date().toLocaleString()}] 异常路径记录: ${basename(pathFile)} - 处理出错（${error.message}）`;
+    log.error(`❌ 处理${basename(pathFile)}出错：${error.message}`);
+    const errorContent = `[${new Date().toLocaleString()}] 异常路径记录：${basename(pathFile)} - 处理出错（${error.message}）`;
     await writeFile("异常路径记录.log", errorContent, true);
+    return null;
   }
 }
-
 // 查找最近的传送点（基于tranPosition计算距离）
 function findClosestTeleport(tpData, targetX, targetY) {
   let closestTp = null;
